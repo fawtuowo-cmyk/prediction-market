@@ -87,6 +87,8 @@ const CREATE_EVENT_SIGNATURE_STORAGE_KEY = 'admin_create_event_signature_flow_v1
 const TITLE_CATEGORY_MIN_LENGTH = 4
 const CONTENT_CHECK_PROGRESS_INTERVAL_MS = 1400
 const SIGNATURE_COUNTDOWN_INTERVAL_MS = 1000
+const FINALIZE_RETRY_DELAY_MS = 1000
+const FINALIZE_MAX_ATTEMPTS = 8
 const SLUG_CHECK_TIMEOUT_MS = 12000
 const OPENROUTER_CHECK_TIMEOUT_MS = 12000
 const CONTENT_CHECK_TIMEOUT_MS = 45000
@@ -341,6 +343,50 @@ function readApiError(payload: unknown): string | null {
   }
 
   return null
+}
+
+async function readResponseBody(response: Response): Promise<{
+  payload: unknown
+  text: string | null
+}> {
+  const raw = await response.text().catch(() => '')
+  const normalized = raw.trim()
+  if (!normalized) {
+    return {
+      payload: null,
+      text: null,
+    }
+  }
+
+  try {
+    return {
+      payload: JSON.parse(normalized) as unknown,
+      text: normalized,
+    }
+  }
+  catch {
+    return {
+      payload: null,
+      text: normalized,
+    }
+  }
+}
+
+function readResponseErrorMessage(payload: unknown, text: string | null): string | null {
+  const apiError = readApiError(payload)
+  if (apiError) {
+    return apiError
+  }
+  if (!text) {
+    return null
+  }
+
+  const cleaned = text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return cleaned.length > 0 ? cleaned : null
 }
 
 function isAllowedCreatorsResponse(payload: unknown): payload is AllowedCreatorsResponse {
@@ -872,10 +918,17 @@ function mapSignatureFlowErrorForUser(message: string): string {
   if (isBigIntSerializationError(message)) {
     return 'Could not send transaction with this wallet provider. Please retry or switch wallet.'
   }
+  if (/too many subrequests|finalize failed \(5\d\d\)|unexpected server error|internal server error/i.test(message)) {
+    return 'Could not finalize the market right now. Please wait a few moments and retry the pending plan.'
+  }
   if (/request arguments:/i.test(message) || /unknown rpc error/i.test(message)) {
     return 'Could not send transaction right now. Please try again in a few moments.'
   }
   return message
+}
+
+function shouldRetryFinalizeRequest(message: string): boolean {
+  return /too many subrequests|finalization in progress|retry finalize to continue|finalize failed \(5\d\d\)|unexpected server error|internal server error|request timed out|failed to fetch|networkerror/i.test(message)
 }
 
 function OutcomeStateDot({ value }: { value: boolean }) {
@@ -3496,33 +3549,42 @@ export default function AdminCreateEventForm({ sportsSlugCatalog }: AdminCreateE
     setSignatureFlowError('')
 
     try {
-      const response = await fetch(`${process.env.CREATE_MARKET_URL}/finalize`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          requestId: preparedSignaturePlan.requestId,
-          creator: eoaAddress,
-          txs: completedTxs,
-        }),
-      })
+      for (let attempt = 1; attempt <= FINALIZE_MAX_ATTEMPTS; attempt += 1) {
+        const response = await fetch(`${process.env.CREATE_MARKET_URL}/finalize`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            requestId: preparedSignaturePlan.requestId,
+            creator: eoaAddress,
+            txs: completedTxs,
+          }),
+        })
 
-      const responsePayload = await response.json().catch(() => null) as unknown
-      const apiError = readApiError(responsePayload)
-      if (!response.ok || apiError || !isFinalizeResponse(responsePayload)) {
-        throw new Error(apiError || `Finalize failed (${response.status})`)
+        const { payload: responsePayload, text: responseText } = await readResponseBody(response)
+        const errorMessage = readResponseErrorMessage(responsePayload, responseText)
+        if (response.ok && !errorMessage && isFinalizeResponse(responsePayload)) {
+          if (responsePayload.requestId !== preparedSignaturePlan.requestId) {
+            throw new Error('Finalize response requestId mismatch.')
+          }
+
+          setSignatureFlowDone(true)
+          setSignatureFlowError('')
+          toast.success('All signatures completed. Your created event will be available on your site shortly.', {
+            duration: 10000,
+          })
+          return
+        }
+
+        const failureMessage = errorMessage || `Finalize failed (${response.status})`
+        const canRetry = attempt < FINALIZE_MAX_ATTEMPTS && shouldRetryFinalizeRequest(failureMessage)
+        if (!canRetry) {
+          throw new Error(failureMessage)
+        }
+
+        await new Promise(resolve => window.setTimeout(resolve, FINALIZE_RETRY_DELAY_MS * attempt))
       }
-
-      if (responsePayload.requestId !== preparedSignaturePlan.requestId) {
-        throw new Error('Finalize response requestId mismatch.')
-      }
-
-      setSignatureFlowDone(true)
-      setSignatureFlowError('')
-      toast.success('All signatures completed. Your created event will be available on your site shortly.', {
-        duration: 10000,
-      })
     }
     finally {
       setIsFinalizingSignatureFlow(false)
